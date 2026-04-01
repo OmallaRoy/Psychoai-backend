@@ -1,0 +1,1 @@
+{"numerical_features": ["hour", "day_of_week", "is_night", "RR_ratio", "Risk Percentage", "Lot Size", "Entry Price", "used_stop_loss", "plan_score", "had_plan", "followed_plan", "deviated", "partial_follow"], "categorical_features": ["Session", "Pair", "Direction", "Market Condition", "emotion_before"]}

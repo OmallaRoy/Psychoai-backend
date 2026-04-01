@@ -1,6 +1,5 @@
 .env
 serviceAccountKey.json
-production_export/
 __pycache__/
 *.pyc
 .DS_Store

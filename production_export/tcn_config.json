@@ -1,0 +1,1 @@
+{"num_numerical": 13, "cat_dims": [7, 11, 2, 8, 9], "embed_dim": 8, "num_channels": [64, 128, 128, 256, 256], "kernel_size": 3, "dropout": 0.4, "num_classes": 8}
