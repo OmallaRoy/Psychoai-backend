@@ -7,15 +7,20 @@ import logging
 from datetime import datetime
 import firebase_admin
 from firebase_admin import firestore, credentials
-from config import MAX_HISTORY_SESSIONS, FIREBASE_CREDS_PATH
+from config import MAX_HISTORY_SESSIONS, FIREBASE_CREDS_PATH, FIREBASE_CREDS_DICT
 
 log = logging.getLogger("memory")
 
 # Only initialize Firebase if main.py has not already done it
 # Fix: prevents "default Firebase app already exists" error
-# when both main.py and memory.py try to initialize at the same time
+# Supports both local file and Railway environment variable
 if not firebase_admin._apps:
-    cred = credentials.Certificate(FIREBASE_CREDS_PATH)
+    if FIREBASE_CREDS_DICT:
+        # Railway — credentials from GOOGLE_CREDENTIALS env variable
+        cred = credentials.Certificate(FIREBASE_CREDS_DICT)
+    else:
+        # Local — credentials from serviceAccountKey.json file
+        cred = credentials.Certificate(FIREBASE_CREDS_PATH)
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()

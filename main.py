@@ -20,8 +20,8 @@ from firebase_admin import credentials, firestore
 from pydantic import BaseModel
 
 from config import (EXPORT_DIR, COLLECTION_NAME,
-                    FIREBASE_CREDS_PATH, COACHING_THRESHOLD,
-                    WINDOW_SIZE)
+                    FIREBASE_CREDS_PATH, FIREBASE_CREDS_DICT,
+                    COACHING_THRESHOLD, WINDOW_SIZE)
 from models import TCN
 from feature_engineering import (
     build_window, get_feature_signals,
@@ -41,8 +41,14 @@ log = logging.getLogger("main")
 # ── Firebase init ──────────────────────────────────────────────
 # Fix: use _apps check so memory.py import does not cause
 # "default Firebase app already exists" error
+# Supports both local file and Railway environment variable
 if not firebase_admin._apps:
-    cred = credentials.Certificate(FIREBASE_CREDS_PATH)
+    if FIREBASE_CREDS_DICT:
+        # Railway — credentials from GOOGLE_CREDENTIALS env variable
+        cred = credentials.Certificate(FIREBASE_CREDS_DICT)
+    else:
+        # Local — credentials from serviceAccountKey.json file
+        cred = credentials.Certificate(FIREBASE_CREDS_PATH)
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
