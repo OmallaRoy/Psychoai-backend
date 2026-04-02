@@ -53,9 +53,17 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 # ── Qdrant init ────────────────────────────────────────────────
+# Fix: force REST over gRPC and add timeout
+# gRPC caused [Errno -2] Name or service not known on Railway
+# REST is more reliable across cloud providers
 from qdrant_client import QdrantClient
 from config import QDRANT_URL, QDRANT_API_KEY
-qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+qdrant = QdrantClient(
+    url         =QDRANT_URL,
+    api_key     =QDRANT_API_KEY,
+    prefer_grpc =False,
+    timeout     =30
+)
 
 # ── Load TCN ───────────────────────────────────────────────────
 with open(EXPORT_DIR + "tcn_config.json")    as f: tcn_cfg = json.load(f)
