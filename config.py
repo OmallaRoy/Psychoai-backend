@@ -5,7 +5,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GROQ_API_KEY         = os.getenv("GROQ_API_KEY")
-QDRANT_URL           = os.getenv("QDRANT_URL")
+
+# Fix: strip any accidental whitespace or equals signs from QDRANT_URL
+# Railway variable was being stored with leading " =" prefix
+# causing [Errno -2] Name or service not known DNS failure
+_raw_qdrant_url = os.getenv("QDRANT_URL", "")
+QDRANT_URL      = _raw_qdrant_url.strip().lstrip("=").strip()
+
 QDRANT_API_KEY       = os.getenv("QDRANT_API_KEY")
 COACHING_THRESHOLD   = float(os.getenv("COACHING_THRESHOLD", "0.55"))
 COLLECTION_NAME      = os.getenv("COLLECTION_NAME", "Psychoai")
