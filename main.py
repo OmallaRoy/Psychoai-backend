@@ -355,7 +355,10 @@ async def health():
         "status":             "ok",
         "device":             str(device),
         "coaching_threshold": COACHING_THRESHOLD,
-        "version":            "1.0.0"
+        "version":            "1.0.0",
+        # Debug — shows what Qdrant URL Railway is actually reading
+        # Remove this after fixing the connection issue
+        "qdrant_url":         QDRANT_URL[:50] if QDRANT_URL else "NOT SET"
     }
 
 
