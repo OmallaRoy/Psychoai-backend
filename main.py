@@ -1,7 +1,3 @@
-# ================================================================
-# FILE: main.py — Complete FastAPI application
-# ================================================================
-
 # main.py
 # Run locally: uvicorn main:app --reload --port 8000
 # Deploy:      Railway reads Procfile automatically
@@ -39,23 +35,15 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 # ── Firebase init ──────────────────────────────────────────────
-# Fix: use _apps check so memory.py import does not cause
-# "default Firebase app already exists" error
-# Supports both local file and Railway environment variable
 if not firebase_admin._apps:
     if FIREBASE_CREDS_DICT:
-        # Railway — credentials from GOOGLE_CREDENTIALS env variable
         cred = credentials.Certificate(FIREBASE_CREDS_DICT)
     else:
-        # Local — credentials from serviceAccountKey.json file
         cred = credentials.Certificate(FIREBASE_CREDS_PATH)
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 # ── Qdrant init ────────────────────────────────────────────────
-# Fix: force REST over gRPC and add timeout
-# gRPC caused [Errno -2] Name or service not known on Railway
-# REST is more reliable across cloud providers
 from qdrant_client import QdrantClient
 from config import QDRANT_URL, QDRANT_API_KEY
 qdrant = QdrantClient(
@@ -160,7 +148,7 @@ def retrieve_similar(embedding: np.ndarray, top_k: int = 3) -> list:
     ]
 
 
-# ── Background coaching task (async — does NOT block response) ─
+# ── Background coaching task ───────────────────────────────────
 async def coaching_background_task(
     trader_id:       str,
     pred_label:      str,
@@ -169,23 +157,13 @@ async def coaching_background_task(
     retrieved_cases: list,
     fcm_token:       Optional[str],
 ):
-    """
-    This implements the ASYNC DECOUPLED ARCHITECTURE:
-    TCN inference (Thread 1) returns immediately.
-    Coaching generation (Thread 2) runs here in background.
-    Trader receives push notification when coaching is ready.
-    """
     try:
         trader_memory = load_trader_memory(trader_id)
-
         coaching = generate_coaching(
             trader_id, pred_label, confidence,
             feature_signals, retrieved_cases, trader_memory
         )
-
-        # Save to Firestore (memory + result storage)
         save_trader_session(trader_id, pred_label, confidence, coaching)
-
         db.collection("coaching_results").add({
             "trader_id":      trader_id,
             "timestamp":      __import__("datetime").datetime.utcnow().isoformat(),
@@ -195,53 +173,36 @@ async def coaching_background_task(
             "signals":        feature_signals,
             "retrieved":      retrieved_cases,
         })
-
-        # Send push notification
         if fcm_token:
             send_coaching_notification(
                 fcm_token, pred_label, coaching, confidence)
-
         log.info("Coaching complete for trader %s: %s", trader_id, pred_label)
-
     except Exception as e:
         log.error("coaching_background_task error for %s: %s", trader_id, e)
 
 
-# ── ENDPOINT 1: Analyze trade (main endpoint) ─────────────────
+# ── ENDPOINT 1: Analyze trade ─────────────────────────────────
 @app.post("/analyze_trade", response_model=AnalyzeResponse)
 async def analyze_trade(
     req: AnalyzeRequest,
     background_tasks: BackgroundTasks
 ):
-    """
-    THREAD 1 — Real-time TCN inference (<50ms).
-    Returns immediately with prediction + similar traders.
-    Coaching is generated asynchronously in background.
-    """
     try:
         trade_dict   = req.trade.model_dump()
         history_list = [h.model_dump() for h in req.history] \
                        if req.history else None
-
         num_w, cat_w, num_vec = build_window(trade_dict, history_list)
-
-        # TCN inference — Thread 1, real-time
         nt = torch.tensor(num_w).unsqueeze(0).to(device)
         ct = torch.tensor(cat_w).unsqueeze(0).to(device)
         with torch.no_grad():
             logits = tcn_model(nt, ct)
             probs  = torch.softmax(logits, dim=1)[0].cpu().numpy()
-
         pred_class  = int(probs.argmax())
         confidence  = float(probs[pred_class])
         pred_label  = target_mapping[pred_class]
         signals     = get_feature_signals(num_vec)
-
-        # Qdrant retrieval
         emb      = extract_embedding(num_w, cat_w)
         similar  = retrieve_similar(emb, top_k=3)
-
-        # Schedule coaching on background thread (Thread 2)
         coaching_pending = False
         if confidence >= COACHING_THRESHOLD:
             coaching_pending = True
@@ -250,11 +211,9 @@ async def analyze_trade(
                 req.trader_id, pred_label, confidence,
                 signals, similar, req.fcm_token
             )
-
         msg = ("Coaching is being generated and will arrive via notification."
                if coaching_pending else
                "Confidence below threshold — no coaching triggered.")
-
         return AnalyzeResponse(
             trader_id         =req.trader_id,
             predicted_mistake =pred_label,
@@ -264,19 +223,14 @@ async def analyze_trade(
             similar_traders   =similar,
             message           =msg,
         )
-
     except Exception as e:
         log.error("analyze_trade error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── ENDPOINT 2: Get latest coaching result ────────────────────
+# ── ENDPOINT 2: Get latest coaching ───────────────────────────
 @app.get("/coaching/{trader_id}/latest")
 async def get_latest_coaching(trader_id: str):
-    """
-    App calls this after receiving FCM push notification.
-    Returns the full coaching text for display in app.
-    """
     try:
         docs = (db.collection("coaching_results")
                   .where("trader_id", "==", trader_id)
@@ -284,7 +238,6 @@ async def get_latest_coaching(trader_id: str):
                             direction=firestore.Query.DESCENDING)
                   .limit(1)
                   .stream())
-
         for doc in docs:
             data = doc.to_dict()
             return {
@@ -294,22 +247,18 @@ async def get_latest_coaching(trader_id: str):
                 "signals":    data.get("signals", []),
                 "timestamp":  data["timestamp"],
             }
-
         return {"message": "No coaching available yet"}
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── ENDPOINT 3: Trader profile / memory ───────────────────────
+# ── ENDPOINT 3: Trader profile ────────────────────────────────
 @app.get("/trader/{trader_id}/profile")
 async def get_trader_profile(trader_id: str):
-    """Returns trader pattern history for in-app display."""
     try:
         doc = db.collection("trader_profiles").document(trader_id).get()
         if not doc.exists:
             return {"trader_id": trader_id, "sessions": 0, "history": []}
-
         profile = doc.to_dict()
         history = profile.get("pattern_history", [])
         return {
@@ -321,26 +270,94 @@ async def get_trader_profile(trader_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── ENDPOINT 4: Chat with Plutus ──────────────────────────────
+# ── ENDPOINT 4: Unified history ───────────────────────────────
+@app.get("/trader/{trader_id}/history")
+async def get_full_history(trader_id: str):
+    """
+    Returns unified history: coaching sessions + chat sessions
+    combined and sorted by date for the history drawer.
+    Coaching sessions come from trader_profiles in Firestore.
+    Chat sessions come from chat_sessions collection.
+    """
+    try:
+        import datetime
+        items = []
+
+        # Coaching sessions from trader_profiles
+        doc = db.collection("trader_profiles").document(trader_id).get()
+        if doc.exists:
+            for entry in doc.to_dict().get("pattern_history", []):
+                items.append({
+                    "type":       "coaching",
+                    "date":       entry.get("date", ""),
+                    "timestamp":  entry.get("timestamp", ""),
+                    "title":      entry.get("pattern", ""),
+                    "preview":    entry.get("coaching_snippet", ""),
+                    "pattern":    entry.get("pattern", ""),
+                    "confidence": entry.get("confidence", 0.0),
+                })
+
+        # Chat sessions from chat_sessions collection
+        try:
+            chats = (db.collection("chat_sessions")
+                       .where("trader_id", "==", trader_id)
+                       .order_by("timestamp",
+                                 direction=firestore.Query.DESCENDING)
+                       .limit(20)
+                       .stream())
+            for chat in chats:
+                d = chat.to_dict()
+                items.append({
+                    "type":       "chat",
+                    "date":       d.get("session_date", ""),
+                    "timestamp":  d.get("timestamp", ""),
+                    "title":      "Chat session",
+                    "preview":    d.get("user_message", "")[:120],
+                    "pattern":    "",
+                    "confidence": 0.0,
+                })
+        except Exception as e:
+            log.warning("Could not load chat sessions: %s", e)
+
+        # Sort newest first
+        items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        return {"trader_id": trader_id, "items": items[:30]}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── ENDPOINT 5: Chat with Plutus ──────────────────────────────
 @app.post("/chat")
 async def chat_with_plutus(req: ChatRequest):
     """
     Conversational endpoint. Trader can discuss their psychology
-    with Plutus directly. LLM remembers trader history.
+    with Plutus directly. Also saves exchange to Firestore
+    so it appears in the unified history drawer.
     """
     try:
         trader_memory = load_trader_memory(req.trader_id)
         response      = generate_chat_response(
             req.trader_id, req.message, trader_memory)
+
+        # Save chat exchange to Firestore for history drawer
+        import datetime
+        db.collection("chat_sessions").add({
+            "trader_id":    req.trader_id,
+            "timestamp":    datetime.datetime.utcnow().isoformat(),
+            "user_message": req.message,
+            "ai_response":  response,
+            "session_date": datetime.datetime.utcnow().isoformat()[:10],
+        })
+
         return {"response": response, "trader_id": req.trader_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── ENDPOINT 5: Save FCM token ────────────────────────────────
+# ── ENDPOINT 6: Save FCM token ────────────────────────────────
 @app.post("/fcm_token")
 async def update_fcm_token(req: SaveTokenRequest):
-    """Called by Kotlin app when FCM token refreshes."""
     try:
         save_fcm_token(req.trader_id, req.token)
         return {"status": "ok"}
@@ -348,7 +365,7 @@ async def update_fcm_token(req: SaveTokenRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── ENDPOINT 6: Health check ──────────────────────────────────
+# ── ENDPOINT 7: Health check ──────────────────────────────────
 @app.get("/health")
 async def health():
     return {
@@ -356,9 +373,6 @@ async def health():
         "device":             str(device),
         "coaching_threshold": COACHING_THRESHOLD,
         "version":            "1.0.0",
-        # Debug — shows what Qdrant URL Railway is actually reading
-        # Remove this after fixing the connection issue
-        "qdrant_url":         QDRANT_URL[:50] if QDRANT_URL else "NOT SET"
     }
 
 
