@@ -1,6 +1,7 @@
 # ================================================================
 # FILE: coaching.py
 # Groq-powered coaching with Plutus system prompt
+# FIX: generate_chat_response now accepts full conversation history
 # ================================================================
 
 import logging
@@ -23,12 +24,17 @@ PRECISE BEHAVIORAL DEFINITIONS — apply these exactly and never confuse them:
 - No Mistake: The trade followed the plan completely and correctly — this is disciplined trading.
 
 CRITICAL RULES YOU MUST FOLLOW:
-1. ONLY reference traders listed in the RETRIEVED HISTORICAL CASES section. Never invent trader IDs, names, or dates.
-2. State specifically WHICH SIGNALS from the Feature Signals section triggered this detection.
-3. If the trader has a history of this pattern, reference it to show continuity of coaching.
-4. Never give price predictions, entry/exit points, or financial recommendations.
-5. Never confuse Revenge with Held Loser — they are opposite behaviors.
-6. Keep your response to 5-7 sentences. Be warm, direct, and specific."""
+1. MAINTAIN CONVERSATION CONTINUITY. If the conversation history shows
+   that you asked a question and the trader is responding to it (e.g.
+   "yes", "go ahead", "tell me more"), CONTINUE from that point.
+   Never re-introduce yourself mid-conversation. Never say
+   "Hello, I'm Plutus" unless this is genuinely the first ever message.
+2. ONLY reference traders listed in the RETRIEVED HISTORICAL CASES section. Never invent trader IDs, names, or dates.
+3. State specifically WHICH SIGNALS from the Feature Signals section triggered this detection.
+4. If the trader has a history of this pattern, reference it to show continuity of coaching.
+5. Never give price predictions, entry/exit points, or financial recommendations.
+6. Never confuse Revenge with Held Loser — they are opposite behaviors.
+7. Keep your response to 5-7 sentences. Be warm, direct, and specific."""
 
 
 def build_coaching_prompt(
@@ -79,6 +85,11 @@ def generate_coaching(
     retrieved_cases: list,
     trader_memory: str,
 ) -> str:
+    """
+    One-shot coaching after TCN detects a psychological mistake.
+    Called asynchronously in the background after /analyze_trade.
+    Does NOT need conversation history — it is always a fresh message.
+    """
     user_msg = build_coaching_prompt(
         trader_id, pred_label, confidence,
         feature_signals, retrieved_cases, trader_memory
@@ -99,33 +110,65 @@ def generate_chat_response(
     trader_id: str,
     user_message: str,
     trader_memory: str,
+    messages: list = None,   # ── FIX: full conversation history
 ) -> str:
     """
     Conversational endpoint — trader chats directly with Plutus.
-    Uses trader display name from trader_id field.
-    Does not volunteer history unprompted — waits for trader to raise it.
+
+    FIX: Now accepts the full conversation history as a list of
+    {"role": "user"/"assistant", "content": "..."} dicts sent
+    from the Android client.
+
+    When messages is provided and non-empty, Groq receives the entire
+    back-and-forth. This fixes the stateless conversation problem where
+    Plutus would re-introduce itself every time the trader replied.
+
+    Example of what was happening before:
+        Plutus: "Would you like to talk about what is driving this?"
+        Roy:    "yes"
+        Groq sees: [system, {"role":"user","content":"yes"}]
+        → Has zero context → defaults to introduction
+
+    Example of what happens now:
+        Groq sees: [system, prev_user_msg, prev_assistant_msg, {"role":"user","content":"yes"}]
+        → Knows what "yes" refers to → continues naturally
     """
     system = (
         PLUTUS_SYSTEM +
         "\n\nYou are in a CONVERSATIONAL SESSION.\n"
         "The trader's identifier is: {}\n"
-        "IMPORTANT: Never address the trader using their ID string. "
+        "IMPORTANT: Never address the trader using their raw ID string. "
         "If their ID looks like a name (e.g. Roy, John), use it warmly. "
-        "If it looks like a random string, just say 'hey' or 'there' naturally.\n\n"
-        "Their behavioral history (only reference if the trader brings it up first):\n{}\n\n"
-        "IMPORTANT CONVERSATION RULES:\n"
-        "- If this appears to be the start of a conversation, greet them warmly and ask how you can help.\n"
-        "- Do NOT volunteer their trading history or past patterns unless they ask.\n"
+        "If it looks like a random string, just say 'hey' or use no name.\n\n"
+        "Their behavioral history (only reference if trader brings it up):\n{}\n\n"
+        "CONVERSATION RULES:\n"
+        "- If conversation history is present and the trader is responding\n"
+        "  to something you said, CONTINUE from that point naturally.\n"
+        "- Do NOT volunteer trading history unless they ask.\n"
         "- Be conversational, warm, and supportive.\n"
         "- Focus on what the trader is telling you right now."
     ).format(trader_id, trader_memory)
 
+    # ── FIX: Build the full messages array for Groq ────────────
+    groq_messages = [{"role": "system", "content": system}]
+
+    if messages and len(messages) > 0:
+        # Use the full history sent from the Android client.
+        # Filter to only valid roles and non-empty content
+        # to prevent any malformed entries causing API errors.
+        for msg in messages:
+            role    = msg.get("role", "")
+            content = msg.get("content", "").strip()
+            if role in ("user", "assistant") and content:
+                groq_messages.append({"role": role, "content": content})
+    else:
+        # Fallback: no history provided (old client or first message)
+        # Just send the current message as a single user turn
+        groq_messages.append({"role": "user", "content": user_message})
+
     response = groq_client.chat.completions.create(
         model    = "llama-3.1-8b-instant",
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user_message},
-        ],
+        messages = groq_messages,
         temperature = 0.35,
         max_tokens  = 400,
     )
@@ -139,6 +182,10 @@ def generate_daily_insight(
     count: int,
     total: int,
 ) -> str:
+    """
+    Short 2-sentence motivational morning message.
+    Called by the daily scheduler at 08:00 UTC.
+    """
     prompt = (
         "Trader {} has shown the pattern '{}' in {}/{} trading sessions this week. "
         "Write a warm, 2-sentence motivational morning message for this trader. "

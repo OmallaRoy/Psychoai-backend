@@ -1,11 +1,16 @@
-# main.py
-# Run locally: uvicorn main:app --reload --port 8000
-# Deploy:      Railway reads Procfile automatically
+# ================================================================
+# FILE: main.py
+# Run locally:  uvicorn main:app --reload --port 8000
+# Deploy:       Railway reads Procfile automatically
+#
+# FIX: ChatRequest now accepts messages list.
+#      /chat endpoint passes full history to generate_chat_response.
+# ================================================================
 
 import json
 import logging
 import pickle
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 import numpy as np
 import torch
@@ -29,8 +34,8 @@ from memory import (load_trader_memory, save_trader_session,
 from notifications import send_coaching_notification, start_scheduler
 
 logging.basicConfig(
-    level  =logging.INFO,
-    format ="%(asctime)s  %(name)s  %(levelname)s  %(message)s"
+    level  = logging.INFO,
+    format = "%(asctime)s  %(name)s  %(levelname)s  %(message)s"
 )
 log = logging.getLogger("main")
 
@@ -47,14 +52,15 @@ db = firestore.client()
 from qdrant_client import QdrantClient
 from config import QDRANT_URL, QDRANT_API_KEY
 qdrant = QdrantClient(
-    url         =QDRANT_URL,
-    api_key     =QDRANT_API_KEY,
-    prefer_grpc =False,
-    timeout     =30
+    url         = QDRANT_URL,
+    api_key     = QDRANT_API_KEY,
+    prefer_grpc = False,
+    timeout     = 30
 )
 
 # ── Load TCN ───────────────────────────────────────────────────
-with open(EXPORT_DIR + "tcn_config.json")    as f: tcn_cfg = json.load(f)
+with open(EXPORT_DIR + "tcn_config.json") as f:
+    tcn_cfg = json.load(f)
 with open(EXPORT_DIR + "target_mapping.json") as f:
     target_mapping = {int(k): v for k, v in json.load(f).items()}
 
@@ -65,14 +71,18 @@ tcn_model.load_state_dict(
 tcn_model.eval()
 log.info("TCN loaded on %s", device)
 
-# ── App ────────────────────────────────────────────────────────
-app = FastAPI(title="Psychoai API", version="1.0.0")
+# ── FastAPI app ────────────────────────────────────────────────
+app = FastAPI(title="Psychoai API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+    allow_origins  = ["*"],
+    allow_methods  = ["*"],
+    allow_headers  = ["*"]
+)
 
 
-# ── Schemas ───────────────────────────────────────────────────
+# ── Pydantic schemas ───────────────────────────────────────────
+
 class TradeData(BaseModel):
     session:          str
     pair:             str
@@ -104,9 +114,21 @@ class AnalyzeResponse(BaseModel):
     similar_traders:    List[dict]
     message:            str
 
+# ── FIX: ChatRequest now includes messages list ────────────────
+# Before: only trader_id and message were sent.
+# Groq received one message with no prior context.
+# Plutus re-introduced itself on every follow-up reply.
+#
+# After: messages carries the full conversation history.
+# Groq receives the entire back-and-forth and responds correctly
+# to follow-ups like "yes", "go ahead", "tell me more".
 class ChatRequest(BaseModel):
     trader_id: str
     message:   str
+    # Full conversation history from client
+    # List of {"role": "user"/"assistant", "content": "..."}
+    # Defaults to [] for backwards compatibility with older app versions
+    messages:  List[Dict[str, str]] = []
 
 class SaveTokenRequest(BaseModel):
     trader_id: str
@@ -116,11 +138,13 @@ class SaveTokenRequest(BaseModel):
 # ── Embedding extraction ───────────────────────────────────────
 def extract_embedding(num_w: np.ndarray, cat_w: np.ndarray) -> np.ndarray:
     activation = {}
+
     def hook(m, i, o):
         activation["e"] = o.detach().cpu()
-    h = tcn_model.classifier[1].register_forward_hook(hook)
-    nt = torch.tensor(num_w).unsqueeze(0).to(device)
-    ct = torch.tensor(cat_w).unsqueeze(0).to(device)
+
+    h   = tcn_model.classifier[1].register_forward_hook(hook)
+    nt  = torch.tensor(num_w).unsqueeze(0).to(device)
+    ct  = torch.tensor(cat_w).unsqueeze(0).to(device)
     with torch.no_grad():
         _ = tcn_model(nt, ct)
     h.remove()
@@ -132,9 +156,9 @@ def extract_embedding(num_w: np.ndarray, cat_w: np.ndarray) -> np.ndarray:
 # ── Qdrant retrieval ───────────────────────────────────────────
 def retrieve_similar(embedding: np.ndarray, top_k: int = 3) -> list:
     hits = qdrant.search(
-        collection_name=COLLECTION_NAME,
-        query_vector   =embedding.tolist(),
-        limit          =top_k
+        collection_name = COLLECTION_NAME,
+        query_vector    = embedding.tolist(),
+        limit           = top_k
     )
     return [
         {
@@ -159,29 +183,29 @@ async def coaching_background_task(
 ):
     try:
         trader_memory = load_trader_memory(trader_id)
-        coaching = generate_coaching(
+        coaching      = generate_coaching(
             trader_id, pred_label, confidence,
             feature_signals, retrieved_cases, trader_memory
         )
         save_trader_session(trader_id, pred_label, confidence, coaching)
         db.collection("coaching_results").add({
-            "trader_id":      trader_id,
-            "timestamp":      __import__("datetime").datetime.utcnow().isoformat(),
-            "pattern":        pred_label,
-            "confidence":     confidence,
-            "coaching":       coaching,
-            "signals":        feature_signals,
-            "retrieved":      retrieved_cases,
+            "trader_id":  trader_id,
+            "timestamp":  __import__("datetime").datetime.utcnow().isoformat(),
+            "pattern":    pred_label,
+            "confidence": confidence,
+            "coaching":   coaching,
+            "signals":    feature_signals,
+            "retrieved":  retrieved_cases,
         })
         if fcm_token:
             send_coaching_notification(
                 fcm_token, pred_label, coaching, confidence)
-        log.info("Coaching complete for trader %s: %s", trader_id, pred_label)
+        log.info("Coaching complete for %s: %s", trader_id, pred_label)
     except Exception as e:
         log.error("coaching_background_task error for %s: %s", trader_id, e)
 
 
-# ── ENDPOINT 1: Analyze trade ─────────────────────────────────
+# ── ENDPOINT 1: Analyze trade ──────────────────────────────────
 @app.post("/analyze_trade", response_model=AnalyzeResponse)
 async def analyze_trade(
     req: AnalyzeRequest,
@@ -191,18 +215,22 @@ async def analyze_trade(
         trade_dict   = req.trade.model_dump()
         history_list = [h.model_dump() for h in req.history] \
                        if req.history else None
+
         num_w, cat_w, num_vec = build_window(trade_dict, history_list)
+
         nt = torch.tensor(num_w).unsqueeze(0).to(device)
         ct = torch.tensor(cat_w).unsqueeze(0).to(device)
         with torch.no_grad():
             logits = tcn_model(nt, ct)
             probs  = torch.softmax(logits, dim=1)[0].cpu().numpy()
-        pred_class  = int(probs.argmax())
-        confidence  = float(probs[pred_class])
-        pred_label  = target_mapping[pred_class]
-        signals     = get_feature_signals(num_vec)
-        emb      = extract_embedding(num_w, cat_w)
-        similar  = retrieve_similar(emb, top_k=3)
+
+        pred_class = int(probs.argmax())
+        confidence = float(probs[pred_class])
+        pred_label = target_mapping[pred_class]
+        signals    = get_feature_signals(num_vec)
+        emb        = extract_embedding(num_w, cat_w)
+        similar    = retrieve_similar(emb, top_k=3)
+
         coaching_pending = False
         if confidence >= COACHING_THRESHOLD:
             coaching_pending = True
@@ -211,17 +239,20 @@ async def analyze_trade(
                 req.trader_id, pred_label, confidence,
                 signals, similar, req.fcm_token
             )
-        msg = ("Coaching is being generated and will arrive via notification."
-               if coaching_pending else
-               "Confidence below threshold — no coaching triggered.")
+
+        msg = (
+            "Coaching is being generated and will arrive via notification."
+            if coaching_pending else
+            "Confidence below threshold — no coaching triggered."
+        )
         return AnalyzeResponse(
-            trader_id         =req.trader_id,
-            predicted_mistake =pred_label,
-            confidence        =round(confidence, 4),
-            coaching_pending  =coaching_pending,
-            feature_signals   =signals,
-            similar_traders   =similar,
-            message           =msg,
+            trader_id         = req.trader_id,
+            predicted_mistake = pred_label,
+            confidence        = round(confidence, 4),
+            coaching_pending  = coaching_pending,
+            feature_signals   = signals,
+            similar_traders   = similar,
+            message           = msg,
         )
     except Exception as e:
         log.error("analyze_trade error: %s", e)
@@ -232,12 +263,13 @@ async def analyze_trade(
 @app.get("/coaching/{trader_id}/latest")
 async def get_latest_coaching(trader_id: str):
     try:
-        docs = (db.collection("coaching_results")
-                  .where("trader_id", "==", trader_id)
-                  .order_by("timestamp",
-                            direction=firestore.Query.DESCENDING)
-                  .limit(1)
-                  .stream())
+        docs = (
+            db.collection("coaching_results")
+              .where("trader_id", "==", trader_id)
+              .order_by("timestamp", direction=firestore.Query.DESCENDING)
+              .limit(1)
+              .stream()
+        )
         for doc in docs:
             data = doc.to_dict()
             return {
@@ -252,7 +284,7 @@ async def get_latest_coaching(trader_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── ENDPOINT 3: Trader profile ────────────────────────────────
+# ── ENDPOINT 3: Trader profile ─────────────────────────────────
 @app.get("/trader/{trader_id}/profile")
 async def get_trader_profile(trader_id: str):
     try:
@@ -270,14 +302,12 @@ async def get_trader_profile(trader_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── ENDPOINT 4: Unified history ───────────────────────────────
+# ── ENDPOINT 4: Unified history ────────────────────────────────
 @app.get("/trader/{trader_id}/history")
 async def get_full_history(trader_id: str):
     """
-    Returns unified history: coaching sessions + chat sessions
-    combined and sorted by date for the history drawer.
-    Coaching sessions come from trader_profiles in Firestore.
-    Chat sessions come from chat_sessions collection.
+    Returns coaching sessions + chat sessions combined for the
+    history drawer in the Android app.
     """
     try:
         import datetime
@@ -297,14 +327,15 @@ async def get_full_history(trader_id: str):
                     "confidence": entry.get("confidence", 0.0),
                 })
 
-        # Chat sessions from chat_sessions collection
+        # Chat sessions
         try:
-            chats = (db.collection("chat_sessions")
-                       .where("trader_id", "==", trader_id)
-                       .order_by("timestamp",
-                                 direction=firestore.Query.DESCENDING)
-                       .limit(20)
-                       .stream())
+            chats = (
+                db.collection("chat_sessions")
+                  .where("trader_id", "==", trader_id)
+                  .order_by("timestamp", direction=firestore.Query.DESCENDING)
+                  .limit(20)
+                  .stream()
+            )
             for chat in chats:
                 d = chat.to_dict()
                 items.append({
@@ -319,7 +350,6 @@ async def get_full_history(trader_id: str):
         except Exception as e:
             log.warning("Could not load chat sessions: %s", e)
 
-        # Sort newest first
         items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
         return {"trader_id": trader_id, "items": items[:30]}
 
@@ -327,57 +357,74 @@ async def get_full_history(trader_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── ENDPOINT 5: Chat with Plutus ──────────────────────────────
+# ── ENDPOINT 5: Chat with Plutus ───────────────────────────────
+# FIX: Now passes req.messages (full conversation history) to
+# generate_chat_response so Groq sees the full context.
 @app.post("/chat")
 async def chat_with_plutus(req: ChatRequest):
     """
-    Conversational endpoint. Trader can discuss their psychology
-    with Plutus directly. Also saves exchange to Firestore
-    so it appears in the unified history drawer.
+    Conversational endpoint. Trader chats with Plutus directly.
+
+    FIX: req.messages now carries the full back-and-forth history
+    from the Android client. This is passed to generate_chat_response
+    which builds the correct Groq messages array so the model
+    sees all prior context and responds accordingly.
     """
     try:
         trader_memory = load_trader_memory(req.trader_id)
-        response      = generate_chat_response(
-            req.trader_id, req.message, trader_memory)
 
-        # Save chat exchange to Firestore for history drawer
-        import datetime
-        db.collection("chat_sessions").add({
-            "trader_id":    req.trader_id,
-            "timestamp":    datetime.datetime.utcnow().isoformat(),
-            "user_message": req.message,
-            "ai_response":  response,
-            "session_date": datetime.datetime.utcnow().isoformat()[:10],
-        })
+        # ── FIX: Pass messages history to coaching.py ──────────
+        response = generate_chat_response(
+            trader_id     = req.trader_id,
+            user_message  = req.message,
+            trader_memory = trader_memory,
+            messages      = req.messages  # ← THE KEY FIX
+        )
+
+        # Save exchange to Firestore for history drawer
+        # Only save when the message has enough content to be meaningful
+        if len(req.message.strip()) > 5:
+            import datetime
+            db.collection("chat_sessions").add({
+                "trader_id":    req.trader_id,
+                "timestamp":    datetime.datetime.utcnow().isoformat(),
+                "user_message": req.message,
+                "ai_response":  response,
+                "session_date": datetime.datetime.utcnow().isoformat()[:10],
+            })
 
         return {"response": response, "trader_id": req.trader_id}
+
     except Exception as e:
+        log.error("/chat error for %s: %s", req.trader_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── ENDPOINT 6: Save FCM token ────────────────────────────────
+# ── ENDPOINT 6: Save FCM token ─────────────────────────────────
 @app.post("/fcm_token")
 async def update_fcm_token(req: SaveTokenRequest):
     try:
         save_fcm_token(req.trader_id, req.token)
+        log.info("FCM token saved for trader %s", req.trader_id)
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── ENDPOINT 7: Health check ──────────────────────────────────
+# ── ENDPOINT 7: Health check ───────────────────────────────────
 @app.get("/health")
 async def health():
     return {
         "status":             "ok",
         "device":             str(device),
         "coaching_threshold": COACHING_THRESHOLD,
-        "version":            "1.0.0",
+        "version":            "1.1.0",
+        "fix":                "conversation history enabled"
     }
 
 
-# ── Startup ───────────────────────────────────────────────────
+# ── Startup ────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     start_scheduler()
-    log.info("Psychoai backend started on %s", device)
+    log.info("Psychoai backend v1.1.0 started on %s", device)
